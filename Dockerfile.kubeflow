@@ -1,0 +1,241 @@
+# Enhanced Dockerfile for LSTM Siamese Text Similarity with Kubeflow Pipeline Support
+FROM tensorflow/tensorflow:2.13.0-gpu
+
+# Set environment variables
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONPATH=/app:$PYTHONPATH
+ENV TF_CPP_MIN_LOG_LEVEL=2
+
+# Install system dependencies as root
+USER root
+
+# Update package lists and install essential tools + Java for Hive
+RUN apt-get update && apt-get install -y \
+    wget \
+    curl \
+    build-essential \
+    openjdk-11-jdk \
+    unzip \
+    git \
+    vim \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set Java environment
+ENV JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
+ENV PATH=$PATH:$JAVA_HOME/bin
+
+# Install uv for fast Python package management as root
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:$PATH"
+
+# Create application directory and set permissions
+RUN mkdir -p /app/lstm-siamese && \
+    mkdir -p /data/input && \
+    mkdir -p /data/output && \
+    mkdir -p /models && \
+    mkdir -p /home/jovyan/.local/bin && \
+    mkdir -p /home/jovyan/.config/uv && \
+    useradd -m -s /bin/bash jovyan && \
+    chown -R jovyan:users /app && \
+    chown -R jovyan:users /data && \
+    chown -R jovyan:users /models && \
+    chown -R jovyan:users /home/jovyan/.local && \
+    chown -R jovyan:users /home/jovyan/.config
+
+# Switch to jovyan user
+USER jovyan
+
+# Install uv for jovyan user
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Add uv to jovyan user's PATH
+ENV PATH="/home/jovyan/.local/bin:$PATH"
+RUN echo 'export PATH="/home/jovyan/.local/bin:$PATH"' >> /home/jovyan/.bashrc
+
+# Set working directory
+WORKDIR /app/lstm-siamese
+
+# Copy requirements file first (for better caching)
+COPY --chown=jovyan:users requirements.txt .
+
+# Create enhanced requirements file with Hive and Kubeflow dependencies
+RUN cat > requirements_enhanced.txt << EOF
+# Base LSTM Siamese requirements
+tensorflow==2.13.0
+tensorboard==2.13.0
+pandas==1.5.3
+Keras==2.13.1
+gensim==4.3.0
+numpy>=1.21.0
+regex
+scipy
+scikit-learn
+nltk>=3.7
+tqdm
+jsonlines
+
+# Hive connectivity
+pyhive[hive]>=0.6.5
+thrift>=0.13.0
+sasl>=0.3.1
+thrift_sasl>=0.4.3
+
+# Kubeflow Pipeline SDK
+kfp>=1.8.0
+kfp-pipeline-spec>=0.1.13
+kubernetes>=18.20.0
+
+# Additional utilities
+PyYAML>=5.4.0
+requests>=2.25.0
+click>=8.0.0
+python-dotenv>=0.19.0
+matplotlib>=3.5.0
+seaborn>=0.11.0
+plotly>=5.0.0
+EOF
+
+# Install enhanced requirements using uv
+RUN /home/jovyan/.local/bin/uv pip install -r requirements_enhanced.txt
+
+# Download NLTK data
+RUN python -c "import nltk; nltk.download('punkt'); nltk.download('stopwords')"
+
+# Verify installations
+RUN python -c "import tensorflow as tf; print(f'TensorFlow version: {tf.__version__}'); print(f'GPU available: {len(tf.config.experimental.list_physical_devices(\"GPU\"))} GPUs')" && \
+    python -c "import pyhive; print('Hive connectivity: OK')" && \
+    python -c "import kfp; print(f'Kubeflow Pipelines SDK version: {kfp.__version__}')"
+
+# Copy the entire project
+COPY --chown=jovyan:users . .
+
+# Copy models into the image if they exist
+RUN mkdir -p /home/jovyan/models
+COPY --chown=jovyan:users models/ /home/jovyan/models/ 2>/dev/null || echo "No models directory found"
+
+# Create a siamese_matcher script wrapper
+RUN cat > siamese_matcher.py << 'EOF'
+#!/usr/bin/env python3
+"""
+LSTM Siamese Text Similarity Matcher
+Production-ready script for text similarity inference
+"""
+
+import argparse
+import pandas as pd
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.models import load_model
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+import pickle
+import os
+import json
+
+def load_siamese_model(model_path):
+    """Load LSTM Siamese model and tokenizer"""
+    model = load_model(model_path)
+    
+    tokenizer_path = model_path.replace('.h5', '_tokenizer.pkl')
+    with open(tokenizer_path, 'rb') as f:
+        tokenizer = pickle.load(f)
+    
+    config_path = model_path.replace('.h5', '_config.json')
+    config = {}
+    if os.path.exists(config_path):
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+    
+    return model, tokenizer, config
+
+def predict_similarity(model, tokenizer, sentences1, sentences2, max_length=100, threshold=0.5):
+    """Make similarity predictions using LSTM Siamese model"""
+    # Convert texts to sequences
+    seq1 = tokenizer.texts_to_sequences(sentences1)
+    seq2 = tokenizer.texts_to_sequences(sentences2)
+    
+    # Pad sequences
+    seq1 = pad_sequences(seq1, maxlen=max_length)
+    seq2 = pad_sequences(seq2, maxlen=max_length)
+    
+    # Create leaks features
+    leaks = []
+    for s1, s2 in zip(sentences1, sentences2):
+        leak_features = [
+            len(s1), len(s2),
+            abs(len(s1) - len(s2)),
+            len(set(s1.split()).intersection(set(s2.split())))
+        ]
+        leaks.append(leak_features)
+    
+    leaks = np.array(leaks)
+    
+    # Make predictions
+    predictions = model.predict([seq1, seq2, leaks])
+    predictions_binary = (predictions.flatten() > threshold).astype(int)
+    
+    return predictions.flatten(), predictions_binary
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="LSTM Siamese Text Similarity Matcher")
+    parser.add_argument("--model-path", required=True, help="Path to model file")
+    parser.add_argument("--input-file", required=True, help="Input CSV file")
+    parser.add_argument("--output-file", required=True, help="Output CSV file")
+    parser.add_argument("--max-length", type=int, default=100, help="Max sequence length")
+    parser.add_argument("--threshold", type=float, default=0.5, help="Similarity threshold")
+    
+    args = parser.parse_args()
+    
+    print(f"Loading model from {args.model_path}")
+    model, tokenizer, config = load_siamese_model(args.model_path)
+    
+    print(f"Loading data from {args.input_file}")
+    df = pd.read_csv(args.input_file)
+    
+    sentences1 = df['sentences1'].tolist()
+    sentences2 = df['sentences2'].tolist()
+    
+    print(f"Making predictions for {len(df)} pairs...")
+    scores, predictions = predict_similarity(
+        model, tokenizer, sentences1, sentences2,
+        max_length=args.max_length, threshold=args.threshold
+    )
+    
+    # Add predictions to DataFrame
+    df['similarity_score'] = scores
+    df['prediction'] = predictions
+    df['model_type'] = 'lstm_siamese'
+    
+    # Save results
+    df.to_csv(args.output_file, index=False)
+    print(f"Results saved to {args.output_file}")
+    print(f"Match rate: {np.mean(predictions):.2%}")
+EOF
+
+RUN chmod +x siamese_matcher.py
+
+# Make scripts executable
+RUN chmod +x *.py
+
+# Create a simple entrypoint script
+RUN cat > entrypoint.sh << 'EOF'
+#!/bin/bash
+set -e
+
+echo "Starting LSTM Siamese Kubeflow Pipeline Container"
+echo "TensorFlow GPU Available: $(python -c 'import tensorflow as tf; print(len(tf.config.experimental.list_physical_devices("GPU")))')"
+echo "Working Directory: $(pwd)"
+echo "Available Files: $(ls -la)"
+
+# Execute the command passed to docker run
+exec "$@"
+EOF
+
+RUN chmod +x entrypoint.sh
+
+# Set default command
+CMD ["python", "--version"]
+
+# Expose ports for Jupyter if needed
+EXPOSE 8888
+
+ENTRYPOINT ["./entrypoint.sh"]
