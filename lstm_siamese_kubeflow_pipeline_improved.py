@@ -431,10 +431,10 @@ save_results_to_hive_op = create_component_from_func(
 )
 
 @dsl.pipeline(
-    name="lstm-siamese-text-similarity",
-    description="LSTM Siamese Text Similarity Pipeline with Kubeflow and Hive integration"
+    name="siamese",
+    description="Siamese Pipeline"
 )
-def lstm_siamese_text_similarity_pipeline(
+def siamese_pipeline(
     # Hive connection parameters
     hive_host: str = "172.17.235.21",
     hive_port: int = 10000,
