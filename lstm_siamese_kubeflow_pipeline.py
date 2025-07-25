@@ -1,6 +1,6 @@
 from datetime import datetime
 from kfp import compiler, dsl
-from typing import NamedTuple, Optional
+from typing import Optional
 import os
 import argparse
 from kfp.components import create_component_from_func
@@ -21,10 +21,10 @@ def extract_hive_data_func(
     hive_database: str,
     input_table: str,
     output_path: str,
-    sample_limit: Optional[int] = None,
+    sample_limit: int = 0,
     matching_mode: str = 'auto'
 ) -> str:
-    """Extract data from Hive table and convert to LSTM Siamese format for text similarity."""
+    """Extract data from Hive table and convert to LSTM Siamese format."""
     from pyhive import hive
     import pandas as pd
     import json
@@ -65,7 +65,7 @@ def extract_hive_data_func(
         
         # Extract data
         query = f"SELECT * FROM {input_table}"
-        if sample_limit:
+        if sample_limit and sample_limit > 0:
             query += f" LIMIT {sample_limit}"
         
         df = pd.read_sql(query, connection)
@@ -207,14 +207,14 @@ def extract_hive_data_func(
 def run_lstm_siamese_func(
     input_path: str,
     output_path: str,
-    model_path: str = "/home/jovyan/models/lstm_siamese_model.h5",
-    tokenizer_path: str = "/home/jovyan/models/tokenizer.pkl",
-    max_sequence_length: int = 100,
-    batch_size: int = 32,
-    similarity_threshold: float = 0.5,
-    use_gpu: bool = True
-) -> NamedTuple('Outputs', [('output_path', str), ('metrics', dict)]):
-    """Run LSTM Siamese matching on the input pairs."""
+    model_path: str,
+    tokenizer_path: str,
+    max_sequence_length: int,
+    batch_size: int,
+    similarity_threshold: float,
+    use_gpu: bool
+):
+    """Run LSTM Siamese matching."""
     import json
     import os
     import numpy as np
@@ -360,8 +360,7 @@ def run_lstm_siamese_func(
             log_and_print(f"GPU used: {gpu_available}")
             log_and_print("=== LSTM SIAMESE MATCHING TASK COMPLETED SUCCESSFULLY ===")
             
-            output = namedtuple('Outputs', ['output_path', 'metrics'])
-            return output(output_path, metrics)
+            return output_path
             
         except Exception as e:
             log_and_print(f"ERROR loading model or making predictions: {str(e)}")
@@ -407,8 +406,7 @@ def run_lstm_siamese_func(
             log_and_print(f"Fallback matching completed. Metrics: {metrics}")
             log_and_print("=== LSTM SIAMESE MATCHING TASK COMPLETED WITH FALLBACK ===")
             
-            output = namedtuple('Outputs', ['output_path', 'metrics'])
-            return output(output_path, metrics)
+            return output_path
         
     except Exception as e:
         log_and_print(f"ERROR in run_lstm_siamese_func: {str(e)}")
@@ -422,9 +420,9 @@ def save_results_to_hive_func(
     hive_user: str,
     hive_database: str,
     output_table: str,
-    save_results: bool = True
+    save_results: bool
 ) -> str:
-    """Optionally save matching results back to Hive."""
+    """Save matching results to Hive."""
     if not save_results:
         print("Skipping Hive save as save_results is False")
         return "Skipped"
@@ -516,7 +514,7 @@ def save_results_to_hive_func(
         return f"Error: {str(e)}"
 
 def create_log_summary_func() -> str:
-    """Create a summary of all logs from the pipeline run."""
+    """Create log summary."""
     import os
     import glob
     from datetime import datetime
@@ -597,7 +595,7 @@ def lstm_siamese_text_similarity_pipeline(
     input_table: str = "preprocessed_analytics.model_reference",
     
     # Data limits (for testing)
-    sample_limit: Optional[int] = None,
+    sample_limit: int = 0,
     
     # Matching mode
     matching_mode: str = 'auto',
@@ -608,18 +606,13 @@ def lstm_siamese_text_similarity_pipeline(
     max_sequence_length: int = 100,
     batch_size: int = 32,
     similarity_threshold: float = 0.5,
-    use_gpu: bool = True,
+    use_gpu: bool = False,
     
     # Output parameters
     save_to_hive: bool = False,
     output_table: str = "lstm_siamese_results"
 ):
-    """
-    Complete LSTM Siamese text similarity pipeline that:
-    1. Extracts data from Hive table
-    2. Runs LSTM Siamese matching
-    3. Optionally saves results back to Hive
-    """
+    """LSTM Siamese text similarity pipeline."""
     
     # Define environment variables for Hive connectivity
     env_vars = [
@@ -689,7 +682,7 @@ def lstm_siamese_text_similarity_pipeline(
     
     # Step 3: Optionally save results to Hive
     save_results = save_results_to_hive_op(
-        results_path="/data/output/similarity_results.jsonl",
+        results_path=matching_results.output,
         hive_host=hive_host,
         hive_port=hive_port,
         hive_user=hive_user,
@@ -716,7 +709,7 @@ def compile_pipeline(
     hive_host: str = "172.17.235.21",
     pipeline_file: str = "lstm-siamese-pipeline.yaml"
 ):
-    """Compile the LSTM Siamese text similarity pipeline."""
+    """Compile pipeline."""
     try:
         compiler.Compiler().compile(
             pipeline_func=lstm_siamese_text_similarity_pipeline,
@@ -737,7 +730,7 @@ def compile_pipeline(
         raise
 
 def main():
-    """Command line interface for pipeline compilation."""
+    """CLI for compilation."""
     parser = argparse.ArgumentParser(description="LSTM Siamese Text Similarity Kubeflow Pipeline")
     
     # Action flags
