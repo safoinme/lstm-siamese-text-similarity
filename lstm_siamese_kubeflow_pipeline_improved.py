@@ -422,12 +422,12 @@ def save_results_to_hive_func(
 # Create Kubeflow components
 extract_and_process_siamese_op = create_component_from_func(
     func=extract_and_process_siamese_func,
-    base_image='172.17.232.16:9001/lstm-siamese:2.0',  # Custom image with TensorFlow + Hive
+    base_image='172.17.232.16:9001/siamese:0.1',  # Custom image with TensorFlow + Hive
 )
 
 save_results_to_hive_op = create_component_from_func(
     func=save_results_to_hive_func,
-    base_image='172.17.232.16:9001/lstm-siamese:2.0',
+    base_image='172.17.232.16:9001/siamese:0.1',
 )
 
 @dsl.pipeline(
