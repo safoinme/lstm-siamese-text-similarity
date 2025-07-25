@@ -204,7 +204,7 @@ def extract_hive_data_func(
         log_and_print("=== EXTRACT FAILED ===")
         raise
 
-def run_lstm_siamese_func(
+def run_siamese_func(
     input_path: str,
     output_path: str,
     model_path: str,
@@ -224,7 +224,7 @@ def run_lstm_siamese_func(
     # Setup logging to shared volume
     log_dir = "/data/logs"
     os.makedirs(log_dir, exist_ok=True)
-    log_file = f"{log_dir}/lstm_siamese_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    log_file = f"{log_dir}/siamese_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     
     def log_and_print(message):
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -336,7 +336,7 @@ def run_lstm_siamese_func(
                     'similarity_score': similarity_score,
                     'match': is_match,
                     'match_confidence': similarity_score,
-                    'model_type': 'lstm_siamese',
+                    'model_type': 'siamese',
                     'threshold_used': similarity_threshold
                 }
                 results.append(result_data)
@@ -446,7 +446,7 @@ def save_results_to_hive_func(
                     'similarity_score': data.get('similarity_score', 0.0),
                     'match': data.get('match', 0),
                     'match_confidence': data.get('match_confidence', 0.0),
-                    'model_type': data.get('model_type', 'lstm_siamese'),
+                    'model_type': data.get('model_type', 'siamese'),
                     'threshold_used': data.get('threshold_used', 0.5),
                     'processing_timestamp': datetime.now().isoformat()
                 })
@@ -556,22 +556,22 @@ def create_log_summary_func() -> str:
 # Create Kubeflow components
 extract_hive_data_op = create_component_from_func(
     func=extract_hive_data_func,
-    base_image='172.17.232.16:9001/lstm-siamese:2.0',
+    base_image='172.17.232.16:9001/siamese:0.1',
 )
 
-run_lstm_siamese_op = create_component_from_func(
-    func=run_lstm_siamese_func,
-    base_image='172.17.232.16:9001/lstm-siamese:2.0',
+run_siamese_op = create_component_from_func(
+    func=run_siamese_func,
+    base_image='172.17.232.16:9001/siamese:0.1',
 )
 
 save_results_to_hive_op = create_component_from_func(
     func=save_results_to_hive_func,
-    base_image='172.17.232.16:9001/lstm-siamese:2.0',
+    base_image='172.17.232.16:9001/siamese:0.1',
 )
 
 create_log_summary_op = create_component_from_func(
     func=create_log_summary_func,
-    base_image='172.17.232.16:9001/lstm-siamese:2.0',
+    base_image='172.17.232.16:9001/siamese:0.1',
 )
 
 def generate_pipeline_name(input_table: str) -> str:
@@ -601,7 +601,7 @@ def siamese_pipeline(
     matching_mode: str = 'auto',
     
     # LSTM Siamese model parameters
-    model_path: str = "/home/jovyan/models/lstm_siamese_model.h5",
+    model_path: str = "/home/jovyan/models/siamese_model.h5",
     tokenizer_path: str = "/home/jovyan/models/tokenizer.pkl",
     max_sequence_length: int = 100,
     batch_size: int = 32,
@@ -610,7 +610,7 @@ def siamese_pipeline(
     
     # Output parameters
     save_to_hive: bool = False,
-    output_table: str = "lstm_siamese_results"
+    output_table: str = "siamese_results"
 ):
     """LSTM Siamese text similarity pipeline."""
     
@@ -653,7 +653,7 @@ def siamese_pipeline(
     extract_data.set_caching_options(enable_caching=CACHE_ENABLED)
     
     # Step 2: Run LSTM Siamese matching
-    matching_results = run_lstm_siamese_op(
+    matching_results = run_siamese_op(
         input_path="/data/input/pairs.jsonl",
         output_path="/data/output/similarity_results.jsonl",
         model_path=model_path,
@@ -763,7 +763,7 @@ def main():
         return pipeline_file
     else:
         print("Use --compile flag to compile the pipeline")
-        print("Example: python lstm_siamese_kubeflow_pipeline.py --compile")
+        print("Example: python siamese_kubeflow_pipeline.py --compile")
         return None
 
 if __name__ == "__main__":
