@@ -213,7 +213,7 @@ def run_lstm_siamese_func(
     batch_size: int,
     similarity_threshold: float,
     use_gpu: bool
-):
+) -> str:
     """Run LSTM Siamese matching."""
     import json
     import os
@@ -682,7 +682,7 @@ def siamese_pipeline(
     
     # Step 3: Optionally save results to Hive
     save_results = save_results_to_hive_op(
-        results_path=matching_results.output,
+        results_path="/data/output/similarity_results.jsonl",
         hive_host=hive_host,
         hive_port=hive_port,
         hive_user=hive_user,
