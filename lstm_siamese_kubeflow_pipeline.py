@@ -43,7 +43,7 @@ def extract_hive_data_func(
         with open(log_file, 'a') as f:
             f.write(log_msg + '\n')
     
-    log_and_print("=== EXTRACT DATA TASK STARTED ===")
+    log_and_print("=== EXTRACT STARTED ===")
     log_and_print(f"Hive Host: {hive_host}:{hive_port}")
     log_and_print(f"Database: {hive_database}")
     log_and_print(f"Input Table: {input_table}")
@@ -196,12 +196,12 @@ def extract_hive_data_func(
         log_and_print(f"Saved to: {output_path}")
         
         connection.close()
-        log_and_print("=== EXTRACT DATA TASK COMPLETED SUCCESSFULLY ===")
+        log_and_print("=== EXTRACT COMPLETE ===")
         return output_path
         
     except Exception as e:
-        log_and_print(f"ERROR in extract_hive_data_func: {str(e)}")
-        log_and_print("=== EXTRACT DATA TASK FAILED ===")
+        log_and_print(f"ERROR: {str(e)}")
+        log_and_print("=== EXTRACT FAILED ===")
         raise
 
 def run_lstm_siamese_func(
@@ -233,7 +233,7 @@ def run_lstm_siamese_func(
         with open(log_file, 'a') as f:
             f.write(log_msg + '\n')
     
-    log_and_print("=== LSTM SIAMESE MATCHING TASK STARTED ===")
+    log_and_print("=== MATCHING STARTED ===")
     log_and_print(f"Input Path: {input_path}")
     log_and_print(f"Output Path: {output_path}")
     log_and_print(f"Model Path: {model_path}")
@@ -358,12 +358,12 @@ def run_lstm_siamese_func(
             log_and_print(f"Match rate: {predictions_binary.mean():.2%}")
             log_and_print(f"Average similarity score: {metrics['avg_similarity']:.3f}")
             log_and_print(f"GPU used: {gpu_available}")
-            log_and_print("=== LSTM SIAMESE MATCHING TASK COMPLETED SUCCESSFULLY ===")
+            log_and_print("=== MATCHING COMPLETE ===")
             
             return output_path
             
         except Exception as e:
-            log_and_print(f"ERROR loading model or making predictions: {str(e)}")
+            log_and_print(f"ERROR: {str(e)}")
             log_and_print("Falling back to simple text matching...")
             
             # Fallback: simple exact text matching
@@ -404,13 +404,13 @@ def run_lstm_siamese_func(
                     f.write(json.dumps(result, ensure_ascii=True) + '\n')
             
             log_and_print(f"Fallback matching completed. Metrics: {metrics}")
-            log_and_print("=== LSTM SIAMESE MATCHING TASK COMPLETED WITH FALLBACK ===")
+            log_and_print("=== MATCHING COMPLETE (FALLBACK) ===")
             
             return output_path
         
     except Exception as e:
-        log_and_print(f"ERROR in run_lstm_siamese_func: {str(e)}")
-        log_and_print("=== LSTM SIAMESE MATCHING TASK FAILED ===")
+        log_and_print(f"ERROR: {str(e)}")
+        log_and_print("=== MATCHING FAILED ===")
         raise
 
 def save_results_to_hive_func(
@@ -527,7 +527,7 @@ def create_log_summary_func() -> str:
         log_files.sort()
         
         with open(summary_file, 'w') as summary:
-            summary.write(f"=== LSTM SIAMESE PIPELINE EXECUTION SUMMARY ===\n")
+            summary.write(f"=== PIPELINE SUMMARY ===\n")
             summary.write(f"Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             summary.write(f"Total log files: {len(log_files)}\n\n")
             
@@ -544,7 +544,7 @@ def create_log_summary_func() -> str:
                         summary.write(f"Error reading {log_file}: {str(e)}\n")
             
             summary.write(f"\n{'='*50}\n")
-            summary.write("=== END OF LSTM SIAMESE PIPELINE SUMMARY ===\n")
+            summary.write("=== END SUMMARY ===\n")
         
         print(f"Log summary created: {summary_file}")
         return summary_file
@@ -578,13 +578,13 @@ def generate_pipeline_name(input_table: str) -> str:
     """Generate a unique pipeline name based on table and timestamp."""
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     table_safe = safe_table_name(input_table).replace('_', '-')
-    return f"lstm-siamese-matching-{table_safe}-{timestamp}"
+    return f"siamese-{table_safe}-{timestamp}"
 
 @dsl.pipeline(
-    name="lstm-siamese-text-similarity",
-    description="LSTM Siamese Text Similarity Pipeline with Hive Integration"
+    name="siamese",
+    description="Siamese Pipeline"
 )
-def lstm_siamese_text_similarity_pipeline(
+def siamese_pipeline(
     # Hive connection parameters
     hive_host: str = "172.17.235.21",
     hive_port: int = 10000,
@@ -627,8 +627,8 @@ def lstm_siamese_text_similarity_pipeline(
     
     # Create a new PVC dynamically
     vop = dsl.VolumeOp(
-        name="create-lstm-siamese-pvc",
-        resource_name="lstm-siamese-shared-data-pvc",
+        name="create-siamese-pvc",
+        resource_name="siamese-data-pvc",
         size="10Gi",
         modes=["ReadWriteOnce"]
     ).volume
@@ -649,7 +649,7 @@ def lstm_siamese_text_similarity_pipeline(
     extract_data.add_pvolumes({'/data': vop})
     for env_var in env_vars:
         extract_data.add_env_variable(env_var)
-    extract_data.set_display_name('Extract Data from Hive')
+    extract_data.set_display_name('Extract Data')
     extract_data.set_caching_options(enable_caching=CACHE_ENABLED)
     
     # Step 2: Run LSTM Siamese matching
@@ -666,7 +666,7 @@ def lstm_siamese_text_similarity_pipeline(
     
     # Add volume and GPU resources
     matching_results.add_pvolumes({'/data': vop})
-    matching_results.set_display_name('Run LSTM Siamese Matching')  
+    matching_results.set_display_name('Siamese Match')  
     
     if use_gpu:
         matching_results.set_gpu_limit(1)
@@ -695,13 +695,13 @@ def lstm_siamese_text_similarity_pipeline(
     save_results.add_pvolumes({'/data': vop})
     for env_var in env_vars:
         save_results.add_env_variable(env_var)
-    save_results.set_display_name('Save Results to Hive')
+    save_results.set_display_name('Save Results')
     save_results.set_caching_options(enable_caching=False)
     
     # Step 4: Create log summary (always runs last)
     log_summary = create_log_summary_op().after(save_results)
     log_summary.add_pvolumes({'/data': vop})
-    log_summary.set_display_name('Create Log Summary')
+    log_summary.set_display_name('Logs')
     log_summary.set_caching_options(enable_caching=False)
 
 def compile_pipeline(
@@ -712,7 +712,7 @@ def compile_pipeline(
     """Compile pipeline."""
     try:
         compiler.Compiler().compile(
-            pipeline_func=lstm_siamese_text_similarity_pipeline,
+            pipeline_func=siamese_pipeline,
             package_path=pipeline_file,
             type_check=True
         )
@@ -731,7 +731,7 @@ def compile_pipeline(
 
 def main():
     """CLI for compilation."""
-    parser = argparse.ArgumentParser(description="LSTM Siamese Text Similarity Kubeflow Pipeline")
+    parser = argparse.ArgumentParser(description="Siamese Pipeline")
     
     # Action flags
     parser.add_argument("--compile", action="store_true", help="Compile the pipeline")
@@ -755,16 +755,15 @@ def main():
             hive_host=args.hive_host,
             pipeline_file=args.output
         )
-        print(f"\nPipeline Steps:")
-        print("1. Extract Data from Hive - Extract and format data for LSTM Siamese")
-        print("2. Run LSTM Siamese Matching - Text similarity using LSTM Siamese model")
-        print("3. Save Results to Hive - Store similarity scores back to Hive")
+        print(f"\nSteps:")
+        print("1. Extract Data")
+        print("2. Run Siamese")
+        print("3. Save Results")
         print(f"\nUsage: Upload {args.output} to your Kubeflow Pipelines UI")
         return pipeline_file
     else:
         print("Use --compile flag to compile the pipeline")
         print("Example: python lstm_siamese_kubeflow_pipeline.py --compile")
-        print("Example: python lstm_siamese_kubeflow_pipeline.py --compile --input-table your_table --hive-host your_host")
         return None
 
 if __name__ == "__main__":
