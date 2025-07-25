@@ -7,11 +7,12 @@ from kfp.components import create_component_from_func
 from kubernetes.client.models import V1EnvVar
 import json
 import time
-import yaml
-import kfp
-import kfp.components as comp
 
 CACHE_ENABLED = True
+
+def safe_table_name(table: str) -> str:
+    """Return the table part of a fully-qualified hive table name."""
+    return table.split('.')[-1]
 
 def extract_hive_data_func(
     hive_host: str,
@@ -23,492 +24,755 @@ def extract_hive_data_func(
     sample_limit: Optional[int] = None,
     matching_mode: str = 'auto'
 ) -> str:
-    """Extract data from Hive table and convert to LSTM Siamese format for similarity matching."""
+    """Extract data from Hive table and convert to LSTM Siamese format for text similarity."""
     from pyhive import hive
     import pandas as pd
     import json
     import os
-    import numpy as np
+    from datetime import datetime
     
-    print(f"Connecting to Hive at {hive_host}:{hive_port}")
+    # Setup logging to shared volume
+    log_dir = "/data/logs"
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = f"{log_dir}/extract_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     
-    # Connect to Hive
-    connection = hive.Connection(
-        host=hive_host,
-        port=hive_port,
-        database=hive_database,
-        username=hive_user,
-        auth='NOSASL'
-    )
+    def log_and_print(message):
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        log_msg = f"[{timestamp}] {message}"
+        print(log_msg)
+        with open(log_file, 'a') as f:
+            f.write(log_msg + '\n')
     
-    # Build query
-    if sample_limit:
-        query = f"SELECT * FROM {input_table} LIMIT {sample_limit}"
-    else:
-        query = f"SELECT * FROM {input_table}"
+    log_and_print("=== EXTRACT DATA TASK STARTED ===")
+    log_and_print(f"Hive Host: {hive_host}:{hive_port}")
+    log_and_print(f"Database: {hive_database}")
+    log_and_print(f"Input Table: {input_table}")
+    log_and_print(f"Output Path: {output_path}")
+    log_and_print(f"Sample Limit: {sample_limit}")
+    log_and_print(f"Matching Mode: {matching_mode}")
     
-    print(f"Executing query: {query}")
+    # Ensure output directory exists
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
     
-    # Execute query and get data
-    df = pd.read_sql(query, connection)
-    print(f"Extracted {len(df)} records from Hive")
-    
-    # Detect table structure
-    columns = list(df.columns)
-    clean_columns = []
-    for col in columns:
-        if '.' in col:
-            clean_col = col.split('.', 1)[1]
-        else:
-            clean_col = col
-        clean_columns.append(clean_col)
-    
-    # Check for _left and _right patterns
-    left_columns = [col for col in clean_columns if col.endswith('_left')]
-    right_columns = [col for col in clean_columns if col.endswith('_right')]
-    
-    # Extract base field names
-    left_fields = {col[:-5] for col in left_columns}  # Remove '_left'
-    right_fields = {col[:-6] for col in right_columns}  # Remove '_right'
-    
-    # Check if we have matching left/right pairs
-    matching_fields = left_fields.intersection(right_fields)
-    
-    if matching_fields and matching_mode != 'testing':
-        # Production mode - left/right columns
-        structure_type = "production"
-        print(f"Production table detected with {len(matching_fields)} matching field pairs")
-        siamese_records = []
+    try:
+        # Connect to Hive
+        connection = hive.Connection(
+            host=hive_host,
+            port=hive_port,
+            username=hive_user,
+            database=hive_database
+        )
         
-        for idx, row in df.iterrows():
-            left_parts = []
-            right_parts = []
+        # Extract data
+        query = f"SELECT * FROM {input_table}"
+        if sample_limit:
+            query += f" LIMIT {sample_limit}"
+        
+        df = pd.read_sql(query, connection)
+        print(f"Extracted {len(df)} records from {input_table}")
+        print(f"Columns: {list(df.columns)}")
+        
+        # Detect and convert to LSTM Siamese format
+        def detect_table_structure(df):
+            columns = list(df.columns)
+            clean_columns = []
+            for col in columns:
+                if '.' in col:
+                    clean_col = col.split('.', 1)[1]
+                else:
+                    clean_col = col
+                clean_columns.append(clean_col)
             
-            for field in matching_fields:
-                # Find the actual column names (with potential table prefixes)
-                left_col = None
-                right_col = None
+            left_columns = [col for col in clean_columns if col.endswith('_left')]
+            right_columns = [col for col in clean_columns if col.endswith('_right')]
+            left_fields = {col[:-5] for col in left_columns}
+            right_fields = {col[:-6] for col in right_columns}
+            matching_fields = left_fields.intersection(right_fields)
+            
+            if matching_fields:
+                structure_type = "production"
+                message = f"Production table detected with {len(matching_fields)} matching field pairs"
+            else:
+                structure_type = "testing"
+                message = f"Testing table detected with {len(clean_columns)} fields for self-matching"
+            
+            return {
+                'type': structure_type,
+                'columns': columns,
+                'clean_columns': clean_columns,
+                'matching_fields': list(matching_fields),
+                'message': message
+            }
+        
+        def convert_production_format(df, structure):
+            records = []
+            for idx, row in df.iterrows():
+                left_parts = []
+                right_parts = []
+                
+                for field in structure['matching_fields']:
+                    left_col = None
+                    right_col = None
+                    
+                    for col in df.columns:
+                        clean_col = col.split('.', 1)[1] if '.' in col else col
+                        if clean_col == f"{field}_left":
+                            left_col = col
+                        elif clean_col == f"{field}_right":
+                            right_col = col
+                    
+                    if left_col and pd.notna(row[left_col]) and str(row[left_col]).strip():
+                        value = str(row[left_col]).strip()
+                        left_parts.append(value)
+                    
+                    if right_col and pd.notna(row[right_col]) and str(row[right_col]).strip():
+                        value = str(row[right_col]).strip()
+                        right_parts.append(value)
+                
+                left_text = " ".join(left_parts)
+                right_text = " ".join(right_parts)
+                
+                record = {
+                    "sentence1": left_text,
+                    "sentence2": right_text,
+                    "id": idx
+                }
+                records.append(record)
+            
+            return records
+        
+        def convert_testing_format(df, structure):
+            records = []
+            for idx, row in df.iterrows():
+                col_val_parts = []
                 
                 for col in df.columns:
-                    clean_col = col.split('.', 1)[1] if '.' in col else col
-                    if clean_col == f"{field}_left":
-                        left_col = col
-                    elif clean_col == f"{field}_right":
-                        right_col = col
+                    if pd.notna(row[col]) and str(row[col]).strip():
+                        if '.' in col:
+                            clean_col = col.split('.', 1)[1]
+                        else:
+                            clean_col = col
+                        
+                        value = str(row[col]).strip()
+                        col_val_parts.append(value)
                 
-                # Process left column
-                if left_col and pd.notna(row[left_col]) and str(row[left_col]).strip():
-                    value = str(row[left_col]).strip()
-                    left_parts.append(value)
+                record_text = " ".join(col_val_parts)
                 
-                # Process right column
-                if right_col and pd.notna(row[right_col]) and str(row[right_col]).strip():
-                    value = str(row[right_col]).strip()
-                    right_parts.append(value)
+                record = {
+                    "sentence1": record_text,
+                    "sentence2": record_text,
+                    "id": idx
+                }
+                records.append(record)
             
-            left_text = " ".join(left_parts)
-            right_text = " ".join(right_parts)
-            
-            record = {
-                'sentences1': left_text,
-                'sentences2': right_text,
-                'record_id': idx
-            }
-            siamese_records.append(record)
+            return records
         
-    else:
-        # Testing mode - self matching
-        structure_type = "testing"
-        print(f"Testing table detected with {len(clean_columns)} fields for self-matching")
-        siamese_records = []
+        def convert_to_siamese_format(df, matching_mode):
+            structure = detect_table_structure(df)
+            
+            # Override detection if mode is specified
+            if matching_mode == 'production':
+                structure['type'] = 'production'
+            elif matching_mode == 'testing':
+                structure['type'] = 'testing'
+            
+            print(structure['message'])
+            
+            if structure['type'] == 'production':
+                if not structure['matching_fields']:
+                    raise ValueError("Production mode requires _left/_right column pairs, but none were found!")
+                return convert_production_format(df, structure)
+            else:
+                return convert_testing_format(df, structure)
         
-        for idx, row in df.iterrows():
-            # Convert row to text representation
-            text_parts = []
-            
-            for col in df.columns:
-                if pd.notna(row[col]) and str(row[col]).strip():
-                    # Remove table name prefix if present
-                    if '.' in col:
-                        clean_col = col.split('.', 1)[1]
-                    else:
-                        clean_col = col
-                    
-                    value = str(row[col]).strip()
-                    text_parts.append(f"{clean_col}: {value}")
-            
-            record_text = " ".join(text_parts)
-            
-            # Create record for inference (compare with itself or generate pairs)
-            record = {
-                'sentences1': record_text,
-                'sentences2': record_text,  # For self-comparison
-                'record_id': idx
-            }
-            siamese_records.append(record)
-    
-    # Convert to DataFrame and save
-    siamese_df = pd.DataFrame(siamese_records)
-    
-    # Create output directory if it doesn't exist
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    
-    # Save as CSV
-    siamese_df.to_csv(output_path, index=False)
-    
-    print(f"Converted {len(siamese_records)} records to LSTM Siamese format")
-    print(f"Saved to: {output_path}")
-    
-    # Close connection
-    connection.close()
-    
-    return output_path
+        siamese_records = convert_to_siamese_format(df, matching_mode)
+        print(f"Converted {len(siamese_records)} records to LSTM Siamese format")
+        
+        # Save to JSONL file in the format expected by the similarity model
+        with open(output_path, 'w', encoding='utf-8') as f:
+            for record in siamese_records:
+                f.write(json.dumps(record, ensure_ascii=True) + '\n')
+        
+        log_and_print(f"Saved to: {output_path}")
+        
+        connection.close()
+        log_and_print("=== EXTRACT DATA TASK COMPLETED SUCCESSFULLY ===")
+        return output_path
+        
+    except Exception as e:
+        log_and_print(f"ERROR in extract_hive_data_func: {str(e)}")
+        log_and_print("=== EXTRACT DATA TASK FAILED ===")
+        raise
 
-def load_pretrained_model_func(
-    model_path: str,
-    model_source: str = 'local'  # 'local', 'gcs', 's3', etc.
-) -> str:
-    """Load pre-trained LSTM Siamese model for inference."""
-    import os
-    import json
-    
-    print(f"Loading pre-trained model from: {model_path}")
-    
-    # In production, you might load from cloud storage
-    if model_source == 'gcs':
-        # Example: download from Google Cloud Storage
-        print("Downloading model from GCS...")
-        # gsutil cp gs://your-bucket/model.h5 /tmp/model.h5
-        pass
-    elif model_source == 's3':
-        # Example: download from AWS S3
-        print("Downloading model from S3...")
-        # aws s3 cp s3://your-bucket/model.h5 /tmp/model.h5
-        pass
-    
-    # Verify model files exist
-    required_files = [
-        model_path,
-        model_path.replace('.h5', '_tokenizer.pkl'),
-        model_path.replace('.h5', '_config.json')
-    ]
-    
-    for file_path in required_files:
-        if not os.path.exists(file_path):
-            print(f"Warning: Model file not found: {file_path}")
-            # In production, you would download from cloud storage here
-    
-    print("✅ Pre-trained model loaded")
-    
-    # Load config to validate model parameters
-    config_path = model_path.replace('.h5', '_config.json')
-    if os.path.exists(config_path):
-        with open(config_path, 'r') as f:
-            model_config = json.load(f)
-        print(f"📊 Model configuration: {model_config}")
-    
-    return model_path
-
-def predict_similarity_func(
-    model_path: str,
+def run_lstm_siamese_func(
     input_path: str,
     output_path: str,
+    model_path: str = "/home/jovyan/models/lstm_siamese_model.h5",
+    tokenizer_path: str = "/home/jovyan/models/tokenizer.pkl",
     max_sequence_length: int = 100,
-    threshold: float = 0.5
-) -> str:
-    """Use pre-trained LSTM Siamese model to predict text similarity."""
-    import pandas as pd
-    import numpy as np
-    import tensorflow as tf
-    from tensorflow.keras.models import load_model
-    from tensorflow.keras.preprocessing.sequence import pad_sequences
-    import pickle
+    batch_size: int = 32,
+    similarity_threshold: float = 0.5,
+    use_gpu: bool = True
+) -> NamedTuple('Outputs', [('output_path', str), ('metrics', dict)]):
+    """Run LSTM Siamese matching on the input pairs."""
+    import json
     import os
+    import numpy as np
+    from collections import namedtuple
+    from datetime import datetime
     
-    print(f"Loading model from {model_path}")
+    # Setup logging to shared volume
+    log_dir = "/data/logs"
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = f"{log_dir}/lstm_siamese_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     
-    # Load model
-    model = load_model(model_path)
+    def log_and_print(message):
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        log_msg = f"[{timestamp}] {message}"
+        print(log_msg)
+        with open(log_file, 'a') as f:
+            f.write(log_msg + '\n')
     
-    # Load tokenizer
-    tokenizer_path = model_path.replace('.h5', '_tokenizer.pkl')
-    with open(tokenizer_path, 'rb') as f:
-        tokenizer = pickle.load(f)
+    log_and_print("=== LSTM SIAMESE MATCHING TASK STARTED ===")
+    log_and_print(f"Input Path: {input_path}")
+    log_and_print(f"Output Path: {output_path}")
+    log_and_print(f"Model Path: {model_path}")
+    log_and_print(f"Max Sequence Length: {max_sequence_length}")
+    log_and_print(f"Batch Size: {batch_size}")
+    log_and_print(f"Similarity Threshold: {similarity_threshold}")
+    log_and_print(f"Use GPU: {use_gpu}")
     
-    print(f"Loading data from {input_path}")
-    
-    # Load data
-    df = pd.read_csv(input_path)
-    
-    sentences1 = df['sentences1'].tolist()
-    sentences2 = df['sentences2'].tolist()
-    
-    print(f"Making predictions for {len(df)} pairs...")
-    
-    # Convert texts to sequences
-    seq1 = tokenizer.texts_to_sequences(sentences1)
-    seq2 = tokenizer.texts_to_sequences(sentences2)
-    
-    # Pad sequences
-    seq1 = pad_sequences(seq1, maxlen=max_sequence_length)
-    seq2 = pad_sequences(seq2, maxlen=max_sequence_length)
-    
-    # Make predictions
-    predictions = model.predict([seq1, seq2])
-    predictions_binary = (predictions.flatten() > threshold).astype(int)
-    
-    # Add predictions to DataFrame
-    results_df = df.copy()
-    results_df['similarity_score'] = predictions.flatten()
-    results_df['prediction'] = predictions_binary
-    results_df['model_type'] = 'lstm_siamese'
-    results_df['threshold_used'] = threshold
-    
-    # Create output directory if it doesn't exist
+    # Ensure output directory exists
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     
-    # Save results
-    results_df.to_csv(output_path, index=False)
-    
-    print(f"Predictions saved to: {output_path}")
-    print(f"Match rate: {np.mean(predictions_binary):.2%}")
-    print(f"Average similarity score: {np.mean(predictions.flatten()):.3f}")
-    
-    return output_path
+    try:
+        # GPU Detection and Setup
+        gpu_available = False
+        if use_gpu:
+            log_and_print("=== GPU SETUP ===")
+            try:
+                import tensorflow as tf
+                gpus = tf.config.experimental.list_physical_devices('GPU')
+                if gpus:
+                    log_and_print(f"GPU Available: {len(gpus)} GPU(s) found")
+                    # Configure GPU memory growth
+                    for gpu in gpus:
+                        tf.config.experimental.set_memory_growth(gpu, True)
+                    gpu_available = True
+                else:
+                    log_and_print("WARNING: GPU requested but not available, falling back to CPU")
+            except Exception as e:
+                log_and_print(f"WARNING: TensorFlow GPU setup failed: {str(e)}, falling back to CPU")
+        else:
+            log_and_print("=== CPU MODE ===")
+        
+        # Load input data
+        log_and_print("Loading input data...")
+        records = []
+        with open(input_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                records.append(json.loads(line.strip()))
+        
+        log_and_print(f"Loaded {len(records)} text pairs for similarity matching")
+        
+        # Load model and tokenizer
+        try:
+            import tensorflow as tf
+            from tensorflow.keras.models import load_model
+            from tensorflow.keras.preprocessing.sequence import pad_sequences
+            import pickle
+            
+            log_and_print(f"Loading LSTM Siamese model from {model_path}")
+            model = load_model(model_path)
+            
+            log_and_print(f"Loading tokenizer from {tokenizer_path}")
+            with open(tokenizer_path, 'rb') as f:
+                tokenizer = pickle.load(f)
+            
+            # Prepare data for prediction
+            sentence1_list = [record['sentence1'] for record in records]
+            sentence2_list = [record['sentence2'] for record in records]
+            
+            log_and_print(f"Converting texts to sequences...")
+            
+            # Convert texts to sequences
+            seq1 = tokenizer.texts_to_sequences(sentence1_list)
+            seq2 = tokenizer.texts_to_sequences(sentence2_list)
+            
+            # Pad sequences
+            seq1 = pad_sequences(seq1, maxlen=max_sequence_length)
+            seq2 = pad_sequences(seq2, maxlen=max_sequence_length)
+            
+            # Create leak features (simple features like length difference)
+            leaks = []
+            for s1, s2 in zip(sentence1_list, sentence2_list):
+                leak_features = [
+                    len(s1), len(s2),
+                    abs(len(s1) - len(s2)),
+                    len(set(s1.split()).intersection(set(s2.split())))
+                ]
+                leaks.append(leak_features)
+            
+            leaks = np.array(leaks)
+            
+            log_and_print(f"Making predictions for {len(records)} text pairs...")
+            
+            # Make predictions in batches
+            predictions = model.predict([seq1, seq2, leaks], batch_size=batch_size)
+            predictions_binary = (predictions.flatten() > similarity_threshold).astype(int)
+            
+            # Process results
+            results = []
+            metrics = {"total_pairs": 0, "matches": 0, "non_matches": 0, "avg_similarity": 0.0}
+            
+            for i, record in enumerate(records):
+                similarity_score = float(predictions[i][0])
+                is_match = int(predictions_binary[i])
+                
+                result_data = {
+                    'id': record.get('id', i),
+                    'sentence1': record['sentence1'],
+                    'sentence2': record['sentence2'],
+                    'similarity_score': similarity_score,
+                    'match': is_match,
+                    'match_confidence': similarity_score,
+                    'model_type': 'lstm_siamese',
+                    'threshold_used': similarity_threshold
+                }
+                results.append(result_data)
+                
+                metrics["total_pairs"] += 1
+                if is_match == 1:
+                    metrics["matches"] += 1
+                else:
+                    metrics["non_matches"] += 1
+            
+            metrics["avg_similarity"] = float(np.mean(predictions.flatten()))
+            
+            # Save results in JSON Lines format
+            with open(output_path, 'w', encoding='utf-8') as f:
+                for result in results:
+                    f.write(json.dumps(result, ensure_ascii=True) + '\n')
+            
+            log_and_print(f"Matching completed. Metrics: {metrics}")
+            log_and_print(f"Match rate: {predictions_binary.mean():.2%}")
+            log_and_print(f"Average similarity score: {metrics['avg_similarity']:.3f}")
+            log_and_print(f"GPU used: {gpu_available}")
+            log_and_print("=== LSTM SIAMESE MATCHING TASK COMPLETED SUCCESSFULLY ===")
+            
+            output = namedtuple('Outputs', ['output_path', 'metrics'])
+            return output(output_path, metrics)
+            
+        except Exception as e:
+            log_and_print(f"ERROR loading model or making predictions: {str(e)}")
+            log_and_print("Falling back to simple text matching...")
+            
+            # Fallback: simple exact text matching
+            results = []
+            metrics = {"total_pairs": 0, "matches": 0, "non_matches": 0, "avg_similarity": 0.0}
+            
+            for i, record in enumerate(records):
+                # Simple exact match fallback
+                s1 = record['sentence1'].lower().strip()
+                s2 = record['sentence2'].lower().strip()
+                is_exact_match = s1 == s2
+                similarity_score = 1.0 if is_exact_match else 0.0
+                
+                result_data = {
+                    'id': record.get('id', i),
+                    'sentence1': record['sentence1'],
+                    'sentence2': record['sentence2'],
+                    'similarity_score': similarity_score,
+                    'match': 1 if is_exact_match else 0,
+                    'match_confidence': similarity_score,
+                    'model_type': 'fallback_exact_match',
+                    'threshold_used': similarity_threshold
+                }
+                results.append(result_data)
+                
+                metrics["total_pairs"] += 1
+                if is_exact_match:
+                    metrics["matches"] += 1
+                else:
+                    metrics["non_matches"] += 1
+            
+            if metrics["total_pairs"] > 0:
+                metrics["avg_similarity"] = metrics["matches"] / metrics["total_pairs"]
+            
+            # Save fallback results
+            with open(output_path, 'w', encoding='utf-8') as f:
+                for result in results:
+                    f.write(json.dumps(result, ensure_ascii=True) + '\n')
+            
+            log_and_print(f"Fallback matching completed. Metrics: {metrics}")
+            log_and_print("=== LSTM SIAMESE MATCHING TASK COMPLETED WITH FALLBACK ===")
+            
+            output = namedtuple('Outputs', ['output_path', 'metrics'])
+            return output(output_path, metrics)
+        
+    except Exception as e:
+        log_and_print(f"ERROR in run_lstm_siamese_func: {str(e)}")
+        log_and_print("=== LSTM SIAMESE MATCHING TASK FAILED ===")
+        raise
 
-def save_to_hive_func(
+def save_results_to_hive_func(
     results_path: str,
     hive_host: str,
     hive_port: int,
     hive_user: str,
     hive_database: str,
-    output_table: str
+    output_table: str,
+    save_results: bool = True
 ) -> str:
-    """Save LSTM Siamese inference results back to Hive."""
+    """Optionally save matching results back to Hive."""
+    if not save_results:
+        print("Skipping Hive save as save_results is False")
+        return "Skipped"
+    
     from pyhive import hive
     import pandas as pd
+    import json
+    import tempfile
+    import os
+    
+    try:
+        # Read results
+        results = []
+        with open(results_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                data = json.loads(line.strip())
+                results.append({
+                    'record_id': data.get('id', 0),
+                    'sentence1': str(data.get('sentence1', ''))[:1000],  # Truncate long text
+                    'sentence2': str(data.get('sentence2', ''))[:1000],
+                    'similarity_score': data.get('similarity_score', 0.0),
+                    'match': data.get('match', 0),
+                    'match_confidence': data.get('match_confidence', 0.0),
+                    'model_type': data.get('model_type', 'lstm_siamese'),
+                    'threshold_used': data.get('threshold_used', 0.5),
+                    'processing_timestamp': datetime.now().isoformat()
+                })
+        
+        if not results:
+            print("No results to save")
+            return "No results"
+        
+        # Convert to DataFrame
+        df = pd.DataFrame(results)
+        
+        # Connect to Hive
+        connection = hive.Connection(
+            host=hive_host,
+            port=hive_port,
+            username=hive_user,
+            database=hive_database
+        )
+        
+        cursor = connection.cursor()
+        
+        # Create table if it doesn't exist
+        create_table_sql = f"""
+        CREATE TABLE IF NOT EXISTS {output_table} (
+            record_id INT,
+            sentence1 STRING,
+            sentence2 STRING,
+            similarity_score DOUBLE,
+            match INT,
+            match_confidence DOUBLE,
+            model_type STRING,
+            threshold_used DOUBLE,
+            processing_timestamp STRING
+        )
+        STORED AS PARQUET
+        """
+        
+        cursor.execute(create_table_sql)
+        
+        # Save DataFrame to temporary CSV
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as temp_file:
+            df.to_csv(temp_file.name, index=False, header=False)
+            temp_path = temp_file.name
+        
+        try:
+            # Load data into Hive table
+            load_sql = f"""
+            LOAD DATA LOCAL INPATH '{temp_path}' 
+            INTO TABLE {output_table}
+            """
+            cursor.execute(load_sql)
+            
+            print(f"Successfully saved {len(results)} results to {output_table}")
+            return f"Saved {len(results)} results to {output_table}"
+            
+        finally:
+            # Clean up temp file
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+                
+        connection.close()
+        
+    except Exception as e:
+        print(f"Error saving to Hive: {str(e)}")
+        return f"Error: {str(e)}"
+
+def create_log_summary_func() -> str:
+    """Create a summary of all logs from the pipeline run."""
+    import os
+    import glob
     from datetime import datetime
     
-    print(f"Loading results from {results_path}")
+    log_dir = "/data/logs"
+    summary_file = f"{log_dir}/pipeline_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     
-    # Load results
-    results_df = pd.read_csv(results_path)
-    
-    # Add timestamp
-    results_df['created_at'] = datetime.now().isoformat()
-    
-    print(f"Connecting to Hive at {hive_host}:{hive_port}")
-    
-    # Connect to Hive
-    connection = hive.Connection(
-        host=hive_host,
-        port=hive_port,
-        database=hive_database,
-        username=hive_user,
-        auth='NOSASL'
-    )
-    
-    cursor = connection.cursor()
-    
-    # Create table if doesn't exist
-    create_table_sql = f"""
-    CREATE TABLE IF NOT EXISTS {output_table} (
-        record_id INT,
-        sentences1 STRING,
-        sentences2 STRING,
-        similarity_score DOUBLE,
-        prediction INT,
-        model_type STRING,
-        threshold_used DOUBLE,
-        created_at STRING
-    )
-    STORED AS PARQUET
-    """
-    
-    cursor.execute(create_table_sql)
-    print(f"Table {output_table} created/verified")
-    
-    # Insert results in batches for better performance
-    insert_count = 0
-    batch_size = 100
-    
-    for i in range(0, len(results_df), batch_size):
-        batch = results_df[i:i+batch_size]
+    try:
+        log_files = glob.glob(f"{log_dir}/*.log")
+        log_files.sort()
         
-        for _, row in batch.iterrows():
-            # Escape single quotes in strings and truncate long text
-            sentences1 = str(row['sentences1']).replace("'", "''")[:1000]
-            sentences2 = str(row['sentences2']).replace("'", "''")[:1000]
+        with open(summary_file, 'w') as summary:
+            summary.write(f"=== LSTM SIAMESE PIPELINE EXECUTION SUMMARY ===\n")
+            summary.write(f"Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            summary.write(f"Total log files: {len(log_files)}\n\n")
             
-            insert_sql = f"""
-            INSERT INTO {output_table} VALUES (
-                {row.get('record_id', insert_count)},
-                '{sentences1}',
-                '{sentences2}',
-                {row.get('similarity_score', 0.0)},
-                {row.get('prediction', 0)},
-                '{row.get('model_type', 'lstm_siamese')}',
-                {row.get('threshold_used', 0.5)},
-                '{row['created_at']}'
-            )
-            """
+            for log_file in log_files:
+                if log_file != summary_file:
+                    summary.write(f"\n{'='*50}\n")
+                    summary.write(f"LOG FILE: {os.path.basename(log_file)}\n")
+                    summary.write(f"{'='*50}\n")
+                    
+                    try:
+                        with open(log_file, 'r') as f:
+                            summary.write(f.read())
+                    except Exception as e:
+                        summary.write(f"Error reading {log_file}: {str(e)}\n")
             
-            cursor.execute(insert_sql)
-            insert_count += 1
+            summary.write(f"\n{'='*50}\n")
+            summary.write("=== END OF LSTM SIAMESE PIPELINE SUMMARY ===\n")
         
-        print(f"Inserted {min(i+batch_size, len(results_df))}/{len(results_df)} records...")
-    
-    print(f"Successfully saved {insert_count} results to {output_table}")
-    
-    # Close connection
-    connection.close()
-    
-    return f"Saved {insert_count} records to {output_table}"
+        print(f"Log summary created: {summary_file}")
+        return summary_file
+        
+    except Exception as e:
+        print(f"Error creating log summary: {str(e)}")
+        return f"Error: {str(e)}"
 
-# Create component operations
+# Create Kubeflow components
 extract_hive_data_op = create_component_from_func(
-    extract_hive_data_func,
-    base_image='python:3.8-slim',
-    packages_to_install=['pyhive', 'thrift', 'thrift_sasl', 'pandas', 'numpy']
+    func=extract_hive_data_func,
+    base_image='172.17.232.16:9001/lstm-siamese:2.0',
 )
 
-load_pretrained_model_op = create_component_from_func(
-    load_pretrained_model_func,
-    base_image='tensorflow/tensorflow:2.13.0',
-    packages_to_install=['pandas', 'numpy']
+run_lstm_siamese_op = create_component_from_func(
+    func=run_lstm_siamese_func,
+    base_image='172.17.232.16:9001/lstm-siamese:2.0',
 )
 
-predict_similarity_op = create_component_from_func(
-    predict_similarity_func,
-    base_image='tensorflow/tensorflow:2.13.0',
-    packages_to_install=['pandas', 'numpy', 'scikit-learn']
+save_results_to_hive_op = create_component_from_func(
+    func=save_results_to_hive_func,
+    base_image='172.17.232.16:9001/lstm-siamese:2.0',
 )
 
-save_to_hive_op = create_component_from_func(
-    save_to_hive_func,
-    base_image='python:3.8-slim',
-    packages_to_install=['pyhive', 'thrift', 'thrift_sasl', 'pandas']
+create_log_summary_op = create_component_from_func(
+    func=create_log_summary_func,
+    base_image='172.17.232.16:9001/lstm-siamese:2.0',
 )
+
+def generate_pipeline_name(input_table: str) -> str:
+    """Generate a unique pipeline name based on table and timestamp."""
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    table_safe = safe_table_name(input_table).replace('_', '-')
+    return f"lstm-siamese-matching-{table_safe}-{timestamp}"
 
 @dsl.pipeline(
-    name='Hive LSTM Siamese Inference Pipeline',
-    description='Text similarity inference using pre-trained LSTM Siamese neural network with Hive integration'
+    name="lstm-siamese-text-similarity",
+    description="LSTM Siamese Text Similarity Pipeline with Hive Integration"
 )
-def lstm_siamese_inference_pipeline(
-    hive_host: str = '172.17.235.21',
+def lstm_siamese_text_similarity_pipeline(
+    # Hive connection parameters
+    hive_host: str = "172.17.235.21",
     hive_port: int = 10000,
-    hive_user: str = 'lhimer',
-    hive_database: str = 'preprocessed_analytics',
-    input_table: str = 'preprocessed_analytics.model_reference',
-    output_table: str = 'results.lstm_siamese_matches',
-    sample_limit: int = 1000,
+    hive_user: str = "lhimer",
+    hive_database: str = "preprocessed_analytics",
+    
+    # Input table
+    input_table: str = "preprocessed_analytics.model_reference",
+    
+    # Data limits (for testing)
+    sample_limit: Optional[int] = None,
+    
+    # Matching mode
     matching_mode: str = 'auto',
-    model_path: str = '/models/siamese_model.h5',
-    model_source: str = 'local',
+    
+    # LSTM Siamese model parameters
+    model_path: str = "/home/jovyan/models/lstm_siamese_model.h5",
+    tokenizer_path: str = "/home/jovyan/models/tokenizer.pkl",
     max_sequence_length: int = 100,
-    threshold: float = 0.5
+    batch_size: int = 32,
+    similarity_threshold: float = 0.5,
+    use_gpu: bool = True,
+    
+    # Output parameters
+    save_to_hive: bool = False,
+    output_table: str = "lstm_siamese_results"
 ):
     """
-    LSTM Siamese Text Similarity Inference Pipeline
-    
-    This pipeline performs inference only - training should be done in the notebook.
-    
-    Args:
-        hive_host: Hive server hostname
-        hive_port: Hive server port (default: 10000)
-        hive_user: Hive username
-        hive_database: Hive database name
-        input_table: Input table name
-        output_table: Output table name for results
-        sample_limit: Number of records to process (for testing)
-        matching_mode: 'auto', 'production', or 'testing'
-        model_path: Path to pre-trained model
-        model_source: 'local', 'gcs', 's3', etc.
-        max_sequence_length: Maximum sequence length for padding
-        threshold: Similarity threshold for binary classification
+    Complete LSTM Siamese text similarity pipeline that:
+    1. Extracts data from Hive table
+    2. Runs LSTM Siamese matching
+    3. Optionally saves results back to Hive
     """
     
-    # Step 1: Extract data from Hive
-    extract_task = extract_hive_data_op(
+    # Define environment variables for Hive connectivity
+    env_vars = [
+        V1EnvVar(name='HIVE_HOST', value=hive_host),
+        V1EnvVar(name='HIVE_PORT', value=str(hive_port)),
+        V1EnvVar(name='HIVE_USER', value=hive_user),
+        V1EnvVar(name='HIVE_DATABASE', value=hive_database)
+    ]
+    
+    # Create a new PVC for this pipeline run
+    from kubernetes import client as k8s_client
+    
+    # Create a new PVC dynamically
+    vop = dsl.VolumeOp(
+        name="create-lstm-siamese-pvc",
+        resource_name="lstm-siamese-shared-data-pvc",
+        size="10Gi",
+        modes=["ReadWriteOnce"]
+    ).volume
+    
+    # Step 1: Extract data from Hive table and create pairs
+    extract_data = extract_hive_data_op(
         hive_host=hive_host,
         hive_port=hive_port,
         hive_user=hive_user,
         hive_database=hive_database,
         input_table=input_table,
-        output_path='/tmp/input_data.csv',
+        output_path="/data/input/pairs.jsonl",
         sample_limit=sample_limit,
         matching_mode=matching_mode
     )
-    extract_task.set_display_name('Extract Data from Hive')
-    extract_task.set_cpu_request('2')
-    extract_task.set_memory_request('8Gi')
-    extract_task.execution_options.caching_strategy.max_cache_staleness = "P0D" if not CACHE_ENABLED else None
     
-    # Step 2: Load pre-trained model
-    load_model_task = load_pretrained_model_op(
+    # Add volume and environment variables
+    extract_data.add_pvolumes({'/data': vop})
+    for env_var in env_vars:
+        extract_data.add_env_variable(env_var)
+    extract_data.set_display_name('Extract Data from Hive')
+    extract_data.set_caching_options(enable_caching=CACHE_ENABLED)
+    
+    # Step 2: Run LSTM Siamese matching
+    matching_results = run_lstm_siamese_op(
+        input_path="/data/input/pairs.jsonl",
+        output_path="/data/output/similarity_results.jsonl",
         model_path=model_path,
-        model_source=model_source
-    )
-    load_model_task.set_display_name('Load Pre-trained Model')
-    load_model_task.set_cpu_request('1')
-    load_model_task.set_memory_request('4Gi')
-    load_model_task.execution_options.caching_strategy.max_cache_staleness = "P0D" if not CACHE_ENABLED else None
-    
-    # Step 3: Make predictions (inference only)
-    predict_task = predict_similarity_op(
-        model_path=load_model_task.output,
-        input_path=extract_task.output,
-        output_path='/tmp/predictions.csv',
+        tokenizer_path=tokenizer_path,
         max_sequence_length=max_sequence_length,
-        threshold=threshold
-    )
-    predict_task.set_display_name('Predict Text Similarity (Inference)')
-    predict_task.set_cpu_request('2')
-    predict_task.set_memory_request('8Gi')
-    # Add GPU if needed for large models
-    # predict_task.set_gpu_limit('1')
-    predict_task.execution_options.caching_strategy.max_cache_staleness = "P0D" if not CACHE_ENABLED else None
+        batch_size=batch_size,
+        similarity_threshold=similarity_threshold,
+        use_gpu=use_gpu
+    ).after(extract_data)
     
-    # Step 4: Save results to Hive
-    save_task = save_to_hive_op(
-        results_path=predict_task.output,
+    # Add volume and GPU resources
+    matching_results.add_pvolumes({'/data': vop})
+    matching_results.set_display_name('Run LSTM Siamese Matching')  
+    
+    if use_gpu:
+        matching_results.set_gpu_limit(1)
+        matching_results.set_memory_limit('16Gi')
+        matching_results.set_memory_request('8Gi')
+    else:
+        matching_results.set_memory_limit('8Gi')
+        matching_results.set_memory_request('4Gi')
+        
+    matching_results.set_cpu_limit('4')
+    matching_results.set_cpu_request('2')
+    matching_results.set_caching_options(enable_caching=False)  # Don't cache matching results
+    
+    # Step 3: Optionally save results to Hive
+    save_results = save_results_to_hive_op(
+        results_path="/data/output/similarity_results.jsonl",
         hive_host=hive_host,
         hive_port=hive_port,
         hive_user=hive_user,
         hive_database=hive_database,
-        output_table=output_table
-    )
-    save_task.set_display_name('Save Results to Hive')
-    save_task.set_cpu_request('2')
-    save_task.set_memory_request('8Gi')
-    save_task.execution_options.caching_strategy.max_cache_staleness = "P0D" if not CACHE_ENABLED else None
+        output_table=output_table,
+        save_results=save_to_hive
+    ).after(matching_results)
+    
+    # Add volume and environment variables
+    save_results.add_pvolumes({'/data': vop})
+    for env_var in env_vars:
+        save_results.add_env_variable(env_var)
+    save_results.set_display_name('Save Results to Hive')
+    save_results.set_caching_options(enable_caching=False)
+    
+    # Step 4: Create log summary (always runs last)
+    log_summary = create_log_summary_op().after(save_results)
+    log_summary.add_pvolumes({'/data': vop})
+    log_summary.set_display_name('Create Log Summary')
+    log_summary.set_caching_options(enable_caching=False)
 
-def compile_pipeline():
-    """Compile the pipeline."""
-    pipeline_filename = 'lstm_siamese_inference_pipeline.yaml'
-    compiler.Compiler().compile(lstm_siamese_inference_pipeline, pipeline_filename)
-    print(f"Pipeline compiled to: {pipeline_filename}")
-    return pipeline_filename
+def compile_pipeline(
+    input_table: str = "preprocessed_analytics.model_reference",
+    hive_host: str = "172.17.235.21",
+    pipeline_file: str = "lstm-siamese-pipeline.yaml"
+):
+    """Compile the LSTM Siamese text similarity pipeline."""
+    try:
+        compiler.Compiler().compile(
+            pipeline_func=lstm_siamese_text_similarity_pipeline,
+            package_path=pipeline_file,
+            type_check=True
+        )
+        
+        pipeline_name = generate_pipeline_name(input_table)
+        print(f"\nPipeline '{pipeline_name}' compiled successfully!")
+        print(f"Pipeline file: {os.path.abspath(pipeline_file)}")
+        print(f"Input table: {input_table}")
+        print(f"Hive Host: {hive_host}")
+        
+        return pipeline_file
+        
+    except Exception as e:
+        print(f"Error compiling pipeline: {str(e)}")
+        raise
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='LSTM Siamese Text Similarity Inference Pipeline')
-    parser.add_argument('--compile', action='store_true', help='Compile the pipeline')
-    parser.add_argument('--cache', action='store_true', default=False, help='Enable caching')
+def main():
+    """Command line interface for pipeline compilation."""
+    parser = argparse.ArgumentParser(description="LSTM Siamese Text Similarity Kubeflow Pipeline")
+    
+    # Action flags
+    parser.add_argument("--compile", action="store_true", help="Compile the pipeline")
+    
+    # Pipeline parameters (optional with defaults)
+    parser.add_argument("--input-table", default="preprocessed_analytics.model_reference", 
+                       help="Input Hive table")
+    parser.add_argument("--hive-host", default="172.17.235.21", help="Hive server host")
+    parser.add_argument("--output", default="lstm-siamese-pipeline.yaml", help="Output pipeline file")
+    parser.add_argument("--no-cache", action="store_true", help="Disable caching")
     
     args = parser.parse_args()
     
-    if args.cache:
-        CACHE_ENABLED = True
+    global CACHE_ENABLED
+    if args.no_cache:
+        CACHE_ENABLED = False
     
     if args.compile:
-        pipeline_file = compile_pipeline()
-        print(f"Inference pipeline compiled successfully: {pipeline_file}")
-        print("\n📋 Pipeline Steps:")
-        print("1. Extract Data from Hive - Extract and format data for inference")
-        print("2. Load Pre-trained Model - Load trained model from storage")
-        print("3. Predict Text Similarity - Run inference on data")
-        print("4. Save Results to Hive - Store predictions back to Hive")
-        print("\n💡 Note: Training should be done in the Jupyter notebook")
+        pipeline_file = compile_pipeline(
+            input_table=args.input_table,
+            hive_host=args.hive_host,
+            pipeline_file=args.output
+        )
+        print(f"\nPipeline Steps:")
+        print("1. Extract Data from Hive - Extract and format data for LSTM Siamese")
+        print("2. Run LSTM Siamese Matching - Text similarity using LSTM Siamese model")
+        print("3. Save Results to Hive - Store similarity scores back to Hive")
+        print(f"\nUsage: Upload {args.output} to your Kubeflow Pipelines UI")
+        return pipeline_file
     else:
         print("Use --compile flag to compile the pipeline")
         print("Example: python lstm_siamese_kubeflow_pipeline.py --compile")
+        print("Example: python lstm_siamese_kubeflow_pipeline.py --compile --input-table your_table --hive-host your_host")
+        return None
+
+if __name__ == "__main__":
+    main()
